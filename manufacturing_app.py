@@ -101,7 +101,7 @@ def utc_naive(dt):
 @st.cache_data(ttl=5)
 def load(station, start, end):
     df = query(
-        """SELECT event_id, event_time AS ts, asset_id, item_ready, at_entry, at_exit, machine_running,
+        """SELECT event_id, event_time AS ts, ingest_time, asset_id, item_ready, at_entry, at_exit, machine_running,
                   entry_conveyor_status, exit_conveyor_status, system_enable, counter_value
            FROM public.sensor_data
            WHERE asset_id = %s AND event_time BETWEEN %s AND %s
@@ -109,6 +109,7 @@ def load(station, start, end):
         (station, utc_naive(start), utc_naive(end)),
     )
     df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize("UTC")    # event_time is stored as UTC
+    df["ingest_time"] = pd.to_datetime(df["ingest_time"]).dt.tz_localize("UTC")  # DB server clock
     # Rolling 60 s throughput (parcels/min) from counter steps; a reset counts as the new value
     step = df["counter_value"].diff()
     step = step.where(step >= 0, df["counter_value"]).fillna(0)
@@ -214,7 +215,10 @@ if df.empty:
 
 good = df                                  # the logger stores only good-quality samples
 last = df.iloc[-1]
-age_s = (now - last["ts"].to_pydatetime()).total_seconds()
+# Freshness uses ingest_time (stamped by the database server), so a drifting clock on the
+# gateway PC cannot make live data look stale. Report the gateway clock offset separately.
+age_s = (now - df["ingest_time"].max().to_pydatetime()).total_seconds()
+clock_offset_s = (last["ingest_time"] - last["ts"]).total_seconds()
 
 # ---------------- KPI row ----------------
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -224,7 +228,12 @@ c3.metric("Machine", "RUNNING" if last["machine_running"] else "STOPPED")
 c4.metric("System enable", "—" if pd.isna(last["system_enable"]) else ("ON" if last["system_enable"] else "OFF"))
 c5.metric("Last update", f"{age_s:.0f} s ago")
 if age_s > STALE_AFTER_S:
-    st.warning(f"Data is stale: last message {age_s:.0f} s ago. The gateway or logger may be stopped.")
+    st.warning(f"Data is stale: last database row arrived {age_s:.0f} s ago. "
+               "The gateway or logger may be stopped.")
+if abs(clock_offset_s) > 5:
+    st.caption(f"Note: the gateway PC clock differs from the database clock by about "
+               f"{clock_offset_s:.0f} s (ingest_time − event_time). Sync the PC clock "
+               "(Windows Settings → Time → Sync now) so event timestamps are accurate.")
 
 tab_trend, tab_tp, tab_kpi, tab_data, tab_ctrl = st.tabs(
     ["Counter trend", "Throughput", "OEE / KPIs", "Raw data", "Controls"])
