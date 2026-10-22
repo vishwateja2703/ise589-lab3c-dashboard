@@ -1,0 +1,4 @@
+streamlit>=1.37
+psycopg[binary]>=3.1
+pandas
+paho-mqtt>=2.0
