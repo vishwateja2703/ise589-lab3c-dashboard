@@ -22,7 +22,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Conveyor Dashboard", page_icon="🏭", layout="wide")
 
-DB_URL = st.secrets["DATABASE_URL"]
+DB_URL = str(st.secrets.get("DATABASE_URL", "")).strip()
 MQTT_HOST = st.secrets.get("MQTT_HOST", "test.mosquitto.org")
 CONTROLS_ENABLED = bool(st.secrets.get("ENABLE_CONTROLS", False))
 STALE_AFTER_S = 15
@@ -126,6 +126,31 @@ def per_minute(station, start, end):
     df["minute"] = pd.to_datetime(df["minute"]).dt.tz_localize("UTC")
     return df
 
+
+# ---------------- database connection check ----------------
+def _db_help(err):
+    t = str(err)
+    if "password authentication failed" in t:
+        return "Password rejected: copy the EXTERNAL Database URL from Render into Secrets again."
+    if "could not translate host name" in t or "Name or service not known" in t:
+        return ("Host not found: use the EXTERNAL Database URL (host ends in "
+                ".oregon-postgres.render.com), not the Internal one.")
+    if "does not exist" in t:
+        return "Database name is wrong: the part after the last '/' must match Render's Database field."
+    if "timeout" in t.lower() or "timed out" in t.lower():
+        return "Connection timed out: the Render database may be suspended or the URL host is wrong."
+    return "Check DATABASE_URL in App settings -> Secrets."
+
+
+if not DB_URL.startswith(("postgresql://", "postgres://")) or "PASSWORD@" in DB_URL or "USER:" in DB_URL:
+    st.error("DATABASE_URL in Secrets is still the template. Paste your Render EXTERNAL Database URL.")
+    st.stop()
+try:
+    get_conn()
+except pg.OperationalError as e:
+    get_conn.clear()
+    st.error(f"Cannot connect to PostgreSQL. {_db_help(e)}")
+    st.stop()
 
 # ---------------- sidebar filters ----------------
 st.sidebar.header("Filters")
