@@ -101,11 +101,11 @@ def utc_naive(dt):
 @st.cache_data(ttl=5)
 def load(station, start, end):
     df = query(
-        """SELECT event_time AS ts, asset_id, item_ready, at_entry, at_exit, machine_running,
+        """SELECT event_id, event_time AS ts, asset_id, item_ready, at_entry, at_exit, machine_running,
                   entry_conveyor_status, exit_conveyor_status, system_enable, counter_value
            FROM public.sensor_data
            WHERE asset_id = %s AND event_time BETWEEN %s AND %s
-           ORDER BY event_time""",
+           ORDER BY event_time, event_id""",
         (station, utc_naive(start), utc_naive(end)),
     )
     df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize("UTC")    # event_time is stored as UTC
@@ -226,7 +226,8 @@ c5.metric("Last update", f"{age_s:.0f} s ago")
 if age_s > STALE_AFTER_S:
     st.warning(f"Data is stale: last message {age_s:.0f} s ago. The gateway or logger may be stopped.")
 
-tab_trend, tab_tp, tab_data, tab_ctrl = st.tabs(["Counter trend", "Throughput", "Raw data", "Controls"])
+tab_trend, tab_tp, tab_kpi, tab_data, tab_ctrl = st.tabs(
+    ["Counter trend", "Throughput", "OEE / KPIs", "Raw data", "Controls"])
 
 with tab_trend:
     st.subheader("Package count over time")
@@ -252,6 +253,95 @@ with tab_tp:
         a.metric("Total parcels in window", int(pm["parcels_per_minute"].sum()))
         b.metric("Mean parcels/min", f"{pm['parcels_per_minute'].mean():.2f}")
         c.metric("Peak parcels/min", int(pm["parcels_per_minute"].max()))
+
+with tab_kpi:
+    # KPI and OEE method from Lectures 13-14 (streamlit_sql_kpi_app.py), applied to the
+    # station and time window selected in the sidebar.
+    k = good[["event_id", "ts", "machine_running", "counter_value"]].copy()
+    k = k.sort_values(["ts", "event_id"]).reset_index(drop=True)
+    k["seconds"] = (k["ts"] - k["ts"].iloc[0]).dt.total_seconds()
+    st.caption(f"Observed window: {k.ts.iloc[0]:%Y-%m-%d %H:%M:%S} to {k.ts.iloc[-1]:%H:%M:%S} UTC "
+               f"• {len(k)} samples • assumption: one counter increment = one completed unit")
+
+    # Output and throughput: the first counter value is the baseline, not window output.
+    elapsed_s = k["seconds"].iloc[-1]
+    counter_change = k["counter_value"].diff()
+    valid_counter = (k["counter_value"].notna().all() and (k["counter_value"] >= 0).all()
+                     and not (counter_change < 0).any())
+    output = None
+    if len(k) >= 2 and elapsed_s > 0 and valid_counter:
+        output = int(k["counter_value"].iloc[-1] - k["counter_value"].iloc[0])
+        throughput = output * 3600 / elapsed_s
+        c1, c2 = st.columns(2)
+        c1.metric("Window output", f"{output} units")
+        c2.metric("Throughput", f"{throughput:.1f} units/hour")
+        st.caption(f"{output} / {elapsed_s:.1f} s × 3600 = {throughput:.1f} units/hour")
+    else:
+        st.info("Output/rate unavailable: need two samples, elapsed time and a counter without "
+                "missing values or resets in this window (narrow the window to after the last reset).")
+
+    # Hold each machine state until the next sample; the final row has no duration.
+    dt = (k["ts"].shift(-1) - k["ts"]).dt.total_seconds()
+    valid_state = (len(k) >= 2 and elapsed_s > 0
+                   and k["machine_running"].iloc[:-1].notna().all()
+                   and dt.iloc[:-1].between(0, 3, inclusive="right").all())
+    run_s = 0.0
+    if valid_state:
+        run_s = float(dt[k["machine_running"].eq(True)].sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Observed running time", f"{run_s:.1f} s")
+        c2.metric("Observed stopped time", f"{elapsed_s - run_s:.1f} s")
+        c3.metric("Observed running fraction", f"{run_s / elapsed_s:.1%}")
+    else:
+        st.info("Running time unavailable: missing states, duplicate times or a sampling gap above 3 s "
+                "(choose a window covering one continuous gateway run).")
+    st.caption("Running fraction is a sampled estimate, not OEE availability.")
+
+    # Completion spacing is observed at polling times, not active cycle time.
+    if valid_counter and len(k) >= 2 and counter_change.iloc[1:].isin([0, 1]).all():
+        gaps_s = k.loc[counter_change.eq(1), "ts"].diff().dt.total_seconds().dropna()
+        if not gaps_s.empty:
+            st.metric("Mean observed completion spacing", f"{gaps_s.mean():.2f} s")
+            st.caption("Includes stops and polling delay; not measured processing cycle time.")
+
+    st.subheader("OEE – enter real production inputs")
+    wkey = f"{station}_{k.event_id.iloc[0]}_{k.event_id.iloc[-1]}"
+    c1, c2 = st.columns(2)
+    planned_min = c1.number_input("Planned production time (minutes)", min_value=0.0, value=0.0,
+                                  step=0.1, key="planned_" + wkey)
+    ideal_s = c2.number_input("Ideal cycle time (seconds/unit)", min_value=0.0, value=0.0,
+                              step=0.1, key="ideal_" + wkey)
+    c1, c2 = st.columns(2)
+    total = c1.number_input("Total completed units", min_value=0, value=0, step=1, key="total_" + wkey)
+    good_units = c2.number_input("First-pass good units", min_value=0, value=0, step=1, key="good_" + wkey)
+    matched = st.checkbox("These inputs match this station and window; measured running time belongs "
+                          "to its planned production time.", key="matched_" + wkey)
+    planned_s = planned_min * 60
+    if not matched:
+        st.info("Enter the actual production inputs and confirm the matching window to calculate OEE.")
+    elif not valid_state or run_s <= 0:
+        st.warning("OEE unavailable: valid positive measured running time is required.")
+    elif planned_s <= 0 or ideal_s <= 0 or total <= 0 or good_units > total:
+        st.warning("Planned time, ideal cycle and total must be positive; good cannot exceed total.")
+    elif planned_s > elapsed_s + 0.001 or run_s > planned_s + 0.001:
+        st.warning("Planned time must fit within the observed window and cannot be shorter than running time.")
+    else:
+        availability = run_s / planned_s
+        performance = ideal_s * total / run_s
+        quality = good_units / total
+        oee = availability * performance * quality
+        a, p_, q, o = st.columns(4)
+        a.metric("Availability", f"{availability:.1%}")
+        p_.metric("Performance", f"{performance:.1%}")
+        q.metric("Quality", f"{quality:.1%}")
+        o.metric("OEE", f"{oee:.1%}")
+        if performance > 1:
+            st.warning("Performance exceeds 100%: check ideal cycle, counts and window. Values are not capped.")
+        if output is not None and total != output:
+            st.warning(f"Entered total ({total}) differs from counter-derived output ({output}). "
+                       "Reconcile count definitions and window boundaries.")
+    st.caption("A = run / planned; P = ideal cycle × total / run; Q = good / total; OEE = A × P × Q. "
+               "No synthetic OEE inputs are supplied.")
 
 with tab_data:
     st.dataframe(df.sort_values("ts", ascending=False), width="stretch", height=420)
